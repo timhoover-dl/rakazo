@@ -484,6 +484,104 @@ describe("computer provisioning", () => {
     }
   });
 
+  it("does not reclaim a fresh suspending row", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "rakazo-fresh-suspend-"));
+    const nowMs = Date.parse("2024-06-01T12:00:00.000Z");
+    const row = {
+      id: "computer-1",
+      homeKey: "bot-1",
+      providerRef: "sandbox-1" as string | null,
+      kind: "cloud",
+      scope: "dedicated",
+      // A suspend that started a moment ago is still in flight, not abandoned.
+      state: "suspending",
+      controlLeaseId: null,
+      updatedAt: new Date(nowMs),
+    };
+    const updateMany = vi.fn();
+    const prisma = {
+      computer: { findUniqueOrThrow: vi.fn(async () => ({ ...row })), updateMany },
+      executionLease: { findFirst: vi.fn(async () => null) },
+      run: { findFirst: vi.fn(async () => null) },
+    } as unknown as PrismaClient;
+    const sandbox = new FakeSandboxProvider();
+    const now = vi.spyOn(Date, "now").mockReturnValue(nowMs);
+
+    try {
+      await expect(
+        provisionComputer(
+          {
+            prisma,
+            sandbox,
+            home: new LocalAgentHomeStore(dataDir),
+            jobs: {} as JobPublisher,
+            events: {} as ThreadEvents,
+            dataDir,
+          },
+          "computer-1",
+          context,
+        ),
+      ).rejects.toBeInstanceOf(ComputerBusyError);
+      expect(updateMany).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a suspending row abandoned past the stale window", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "rakazo-abandoned-suspend-"));
+    const nowMs = Date.parse("2024-06-01T12:00:00.000Z");
+    const row = {
+      id: "computer-1",
+      homeKey: "bot-1",
+      providerRef: "sandbox-gone" as string | null,
+      kind: "cloud",
+      scope: "dedicated",
+      state: "suspending",
+      controlLeaseId: null,
+      // Older than an execution-lease TTL with no live holder: the suspend never finished,
+      // and without reclaim this row would refuse every future run forever.
+      updatedAt: new Date(nowMs - 30 * 60_000),
+    };
+    const updateMany = vi.fn(async () => {
+      row.state = "error";
+      row.providerRef = null;
+      return { count: 1 };
+    });
+    const prisma = {
+      computer: { findUniqueOrThrow: vi.fn(async () => ({ ...row })), updateMany },
+      executionLease: { findFirst: vi.fn(async () => null) },
+      run: { findFirst: vi.fn(async () => null) },
+    } as unknown as PrismaClient;
+    const sandbox = new FakeSandboxProvider();
+    const now = vi.spyOn(Date, "now").mockReturnValue(nowMs);
+
+    try {
+      await provisionComputer(
+        {
+          prisma,
+          sandbox,
+          home: new LocalAgentHomeStore(dataDir),
+          jobs: {} as JobPublisher,
+          events: {} as ThreadEvents,
+          dataDir,
+        },
+        "computer-1",
+        context,
+      );
+      expect(updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "computer-1", state: "suspending" },
+          data: { state: "error", providerRef: null },
+        }),
+      );
+    } finally {
+      now.mockRestore();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not reclaim a stale booting claim while another run still holds a live worker lease", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "rakazo-stale-boot-live-run-"));
     const row = {

@@ -44,6 +44,44 @@ const BOOT_WAIT_MS = 250;
 const BOOT_CLAIM_STALE_MS = EXECUTION_LEASE_MS;
 
 /**
+ * A suspend that never finishes has no reclaim path. Unlike "booting", ComputerBusyError on
+ * "suspending" is permanent: nothing ages the row out, so it wedges every bot sharing the
+ * computer until someone edits the database, and Reset refuses for the same reason. Sandbox
+ * providers reap idle machines on their own clock (E2B uses SANDBOX_IDLE_MS), so a suspend
+ * racing that expiry strands the row against a sandbox that no longer exists.
+ */
+const SUSPEND_CLAIM_STALE_MS = EXECUTION_LEASE_MS;
+
+/**
+ * Demote a suspend that is still unfinished after the boot wait to "error", the state the
+ * existing recovery paths already accept, rather than adding a second reclaim protocol.
+ * Only called once waiting has already given a real suspend its chance to complete, so a
+ * row that is still "suspending" and older than an execution-lease TTL is abandoned.
+ * providerRef is cleared: the sandbox it names is the one whose loss stranded the suspend.
+ * The state guard in the update fences a concurrent caller that moved the row meanwhile.
+ */
+async function reclaimAbandonedSuspend(
+  prisma: PrismaClient,
+  computerId: string,
+  computer: { state: string; updatedAt: Date },
+  exceptRunId?: string,
+) {
+  if (computer.state !== "suspending") return computer;
+  if (Date.now() - computer.updatedAt.getTime() < SUSPEND_CLAIM_STALE_MS) return computer;
+  if (await hasLiveForeignRunLease(prisma, computerId, exceptRunId)) return computer;
+  const activeRun = await prisma.run.findFirst({
+    where: { status: { in: [...ACTIVE_RUN_STATUSES] }, bot: { computerId } },
+    select: { id: true },
+  });
+  if (activeRun) return computer;
+  await prisma.computer.updateMany({
+    where: { id: computerId, state: "suspending" },
+    data: { state: "error", providerRef: null },
+  });
+  return prisma.computer.findUniqueOrThrow({ where: { id: computerId } });
+}
+
+/**
  * "Nobody but us holds this computer."
  *
  * Whoever moves a computer to "booting" holds its execution lease for the whole provision,
@@ -182,6 +220,7 @@ export async function provisionComputer(
   if (existing.state === "booting" || existing.state === "suspending") {
     existing = await waitForComputerReady(deps.prisma, computerId, context);
   }
+  existing = await reclaimAbandonedSuspend(deps.prisma, computerId, existing, context.runId);
   // A booting row whose holder is gone is reclaimable; suspending is not.
   if (!["running", "stopped", "suspended", "error", "booting"].includes(existing.state)) {
     throw new ComputerBusyError();
@@ -586,6 +625,7 @@ export async function replaceComputer(
   if (hasActiveComputerControl(existing)) {
     throw new ComputerBusyError();
   }
+  existing = await reclaimAbandonedSuspend(deps.prisma, computerId, existing);
   if (existing.state === "suspending") {
     throw new ComputerBusyError();
   }
